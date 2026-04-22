@@ -14,6 +14,69 @@ def embed_text(text):
     return embedding.tolist()
 
 
+
+from db import get_conn
+
+def store_embedding(client_id, text, embedding):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO documents (client_id, content, embedding)
+        VALUES (%s, %s, %s)
+        """,
+        (client_id, text, embedding)
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def ingest(client_id="default"):
+    docs = load_documents()
+
+    for doc in docs:
+        chunks = chunk_text(doc["text"])
+
+        for chunk in chunks:
+            embedding = embed_text(chunk)
+            store_embedding(client_id, chunk, embedding)
+
+    print("Ingestion complete")
+
+
+
+def search(query, client_id="default", top_k=3):
+    query_embedding = embed_text(query)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT content, embedding <=> %s AS distance
+        FROM documents
+        WHERE client_id = %s
+        ORDER BY embedding <=> %s
+        LIMIT %s
+        """,
+        (query_embedding, client_id, query_embedding, top_k)
+    )
+
+    results = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    return [
+        {
+            "text": r[0],
+            "score": 1 - r[1]  # convert distance → similarity
+        }
+        for r in results
+    ]
 # -----------------------------
 # LOAD DOCUMENTS
 # -----------------------------

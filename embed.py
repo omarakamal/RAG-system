@@ -200,9 +200,6 @@ def ask_question(query):
 if __name__ == "__main__":
     load_vectors()
 
-    if not VECTOR_DB:
-        ingest()
-
     query = "my order did not get here?"
 
     response = ask_question(query)
@@ -216,8 +213,6 @@ if __name__ == "__main__":
 
 
 def init(question):
-    if not VECTOR_DB:
-        ingest()
 
 
     response = ask_question(question)

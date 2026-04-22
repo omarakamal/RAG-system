@@ -1,33 +1,19 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from embed import (
-    load_vectors,
-    ask_question,
-    ingest,
-    VECTOR_DB,
-    load_documents
-)
+from embed import load_vectors, ask_question, ingest, VECTOR_DB
 
 app = FastAPI()
 
-
 # -----------------------------
-# MODELS
+# REQUEST MODEL
 # -----------------------------
 class ChatRequest(BaseModel):
     query: str
 
-
-class IngestRequest(BaseModel):
-    # optional later: client_id
-    pass
-
-
 # -----------------------------
-# STARTUP (ONLY LOAD)
+# STARTUP (LOAD ONLY)
 # -----------------------------
 load_vectors()
-
 
 # -----------------------------
 # CHAT ENDPOINT
@@ -44,15 +30,11 @@ def chat(req: ChatRequest):
         "sources": response["sources"]
     }
 
-
 # -----------------------------
 # INGEST ENDPOINT
 # -----------------------------
 @app.post("/ingest")
 def ingest_data():
-    """
-    Rebuilds vector DB from current documents
-    """
     ingest()
 
     return {

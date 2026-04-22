@@ -1,82 +1,18 @@
 from sentence_transformers import SentenceTransformer
 import os
-import json
 import numpy as np
 import requests
+from db import get_conn
 
 # -----------------------------
-# MODEL (OPTIMIZED: normalize embeddings)
+# MODEL
 # -----------------------------
 model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def embed_text(text):
-    embedding = model.encode(text, normalize_embeddings=True)
-    return embedding.tolist()
+    return model.encode(text, normalize_embeddings=True).tolist()
 
 
-
-from db import get_conn
-
-def store_embedding(client_id, text, embedding):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO documents (client_id, content, embedding)
-        VALUES (%s, %s, %s)
-        """,
-        (client_id, text, embedding)
-    )
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-def ingest(client_id="default"):
-    docs = load_documents()
-
-    for doc in docs:
-        chunks = chunk_text(doc["text"])
-
-        for chunk in chunks:
-            embedding = embed_text(chunk)
-            store_embedding(client_id, chunk, embedding)
-
-    print("Ingestion complete")
-
-
-
-def search(query, client_id="default", top_k=3):
-    query_embedding = embed_text(query)
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT content, embedding <=> %s AS distance
-        FROM documents
-        WHERE client_id = %s
-        ORDER BY embedding <=> %s
-        LIMIT %s
-        """,
-        (query_embedding, client_id, query_embedding, top_k)
-    )
-
-    results = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    return [
-        {
-            "text": r[0],
-            "score": 1 - r[1]  # convert distance → similarity
-        }
-        for r in results
-    ]
 # -----------------------------
 # LOAD DOCUMENTS
 # -----------------------------
@@ -95,105 +31,114 @@ def load_documents(folder="data"):
 
 
 # -----------------------------
-# BETTER CHUNKING (sentence-aware-ish)
+# CHUNKING
 # -----------------------------
 def chunk_text(text, chunk_size=200, overlap=40):
     words = text.split()
-
     step = chunk_size - overlap
     chunks = []
 
     for i in range(0, len(words), step):
         chunk = " ".join(words[i:i + chunk_size])
 
-        if len(chunk.strip()) > 0:
+        if chunk.strip():
             chunks.append(chunk)
 
     return chunks
 
 
 # -----------------------------
-# VECTOR DB
+# STORE EMBEDDING (DB)
 # -----------------------------
-VECTOR_DB = []
+def store_embedding(client_id, text, embedding):
+    conn = get_conn()
+    cur = conn.cursor()
 
+    cur.execute(
+        """
+        INSERT INTO documents (client_id, content, embedding)
+        VALUES (%s, %s, %s)
+        """,
+        (client_id, text, embedding)
+    )
 
-# -----------------------------
-# SAVE / LOAD
-# -----------------------------
-def save_vectors(filename="vectors.json"):
-    with open(filename, "w") as f:
-        json.dump(VECTOR_DB, f)
-
-
-def load_vectors(filename="vectors.json"):
-    global VECTOR_DB
-
-    if os.path.exists(filename):
-        try:
-            with open(filename, "r") as f:
-                VECTOR_DB = json.load(f)
-            print(f"Loaded {len(VECTOR_DB)} vectors from disk")
-        except json.JSONDecodeError:
-            VECTOR_DB = []
+    conn.commit()
+    cur.close()
+    conn.close()
 
 
 # -----------------------------
-# INGESTION (OPTIMIZED)
+# CLEAR CLIENT DATA (IMPORTANT)
 # -----------------------------
-def ingest():
+def clear_client_data(client_id):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        "DELETE FROM documents WHERE client_id = %s",
+        (client_id,)
+    )
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# -----------------------------
+# INGESTION (DB ONLY)
+# -----------------------------
+def ingest(client_id="default"):
     docs = load_documents()
 
-    global VECTOR_DB
-    VECTOR_DB = []
+    # optional: clear old data before re-ingesting
+    clear_client_data(client_id)
 
     for doc in docs:
         chunks = chunk_text(doc["text"])
 
         for chunk in chunks:
-            VECTOR_DB.append({
-                "text": chunk,
-                "source": doc["source"],
-                "embedding": embed_text(chunk)
-            })
+            embedding = embed_text(chunk)
+            store_embedding(client_id, chunk, embedding)
 
-    print(f"Loaded {len(VECTOR_DB)} chunks into vector DB")
+    print(f"Ingestion complete for client: {client_id}")
 
-    save_vectors()
 
+def to_vector_str(vec):
+    return "[" + ",".join(map(str, vec)) + "]"
 
 # -----------------------------
-# FAST COSINE (NO NUMPY LOOP COST)
+# SEARCH (pgvector)
 # -----------------------------
-def cosine_similarity(a, b):
-    a = np.array(a)
-    b = np.array(b)
-
-    return np.dot(a, b)  # embeddings already normalized → dot product is enough
-
-
-# -----------------------------
-# SEARCH (OPTIMIZED LOOP)
-# -----------------------------
-def search(query, top_k=3):
+def search(query, client_id="default", top_k=3):
     query_embedding = embed_text(query)
+    query_vec = to_vector_str(query_embedding)
 
-    results = []
+    conn = get_conn()
+    cur = conn.cursor()
 
-    for item in VECTOR_DB:
-        score = cosine_similarity(query_embedding, item["embedding"])
+    cur.execute(
+        """
+        SELECT content, embedding <=> %s::vector AS distance
+        FROM documents
+        WHERE client_id = %s
+        ORDER BY embedding <=> %s::vector
+        LIMIT %s
+        """,
+        (query_vec, client_id, query_vec, top_k)
+    )
 
-        results.append({
-            "score": float(score),
-            "text": item["text"],
-            "source": item["source"]
-        })
+    results = cur.fetchall()
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+    cur.close()
+    conn.close()
 
-    return results[:top_k]
-
-
+    return [
+        {
+            "text": r[0],
+            "score": float(1 - r[1])
+        }
+        for r in results
+    ]
 # -----------------------------
 # CONTEXT
 # -----------------------------
@@ -202,16 +147,16 @@ def build_context(results):
 
 
 # -----------------------------
-# PROMPT (FIXED + CLEAN)
+# PROMPT
 # -----------------------------
 def build_prompt(context, query):
     return f"""
-You are a helpful assistant for a meal plan service.
+You are a helpful customer support assistant.
 
 Rules:
 - Only use the context below
 - If not found, say "I don't know"
-- Be concise
+- Be concise and helpful
 
 Context:
 {context}
@@ -224,7 +169,7 @@ Answer:
 
 
 # -----------------------------
-# REAL LLM CALL (Ollama)
+# LLM CALL (Ollama)
 # -----------------------------
 def generate_answer(prompt):
     response = requests.post(
@@ -240,10 +185,10 @@ def generate_answer(prompt):
 
 
 # -----------------------------
-# MAIN PIPELINE (FIXED)
+# MAIN PIPELINE
 # -----------------------------
-def ask_question(query):
-    results = search(query)
+def ask_question(query, client_id="default"):
+    results = search(query, client_id)
 
     context = build_context(results)
 
@@ -258,30 +203,21 @@ def ask_question(query):
 
 
 # -----------------------------
-# RUN
+# LOCAL TEST
 # -----------------------------
 if __name__ == "__main__":
-    load_vectors()
+    client_id = "test_client"
 
+    # 1. ingest data
+    ingest(client_id)
+
+    # 2. query
     query = "my order did not get here?"
 
-    response = ask_question(query)
+    response = ask_question(query, client_id)
 
     print("\nANSWER:\n", response["answer"])
 
     print("\nSOURCES:")
     for r in response["sources"]:
-        print("-", round(r["score"], 3), r["source"])
-
-
-
-def init(question):
-
-
-    response = ask_question(question)
-
-    print("\nANSWER:\n", response["answer"])
-
-    print("\nSOURCES:")
-    for r in response["sources"]:
-        print("-", round(r["score"], 3), r["source"])
+        print("-", round(r["score"], 3))

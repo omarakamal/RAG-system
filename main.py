@@ -1,221 +1,55 @@
-from sentence_transformers import SentenceTransformer
-import os
-import numpy as np
-import requests
-from db import get_conn
+from fastapi import FastAPI
+from pydantic import BaseModel
+from typing import List, Optional
 
-# -----------------------------
-# MODEL
-# -----------------------------
-model = SentenceTransformer('all-MiniLM-L6-v2')
+from embed import ingest, ask_question
 
-def embed_text(text):
-    return model.encode(text, normalize_embeddings=True).tolist()
+app = FastAPI(title="RAG AI Backend")
 
 
 # -----------------------------
-# LOAD DOCUMENTS
+# REQUEST MODELS
 # -----------------------------
-def load_documents(folder="data"):
-    docs = []
+class ChatRequest(BaseModel):
+    client_id: str
+    query: str
 
-    for file in os.listdir(folder):
-        if file.endswith(".txt"):
-            with open(os.path.join(folder, file), "r", encoding="utf-8") as f:
-                docs.append({
-                    "source": file,
-                    "text": f.read()
-                })
 
-    return docs
+class IngestRequest(BaseModel):
+    client_id: str
 
 
 # -----------------------------
-# CHUNKING
+# CHAT ENDPOINT
 # -----------------------------
-def chunk_text(text, chunk_size=200, overlap=40):
-    words = text.split()
-    step = chunk_size - overlap
-    chunks = []
+@app.post("/chat")
+def chat(req: ChatRequest):
+    if not req.query:
+        return {"error": "No query provided"}
 
-    for i in range(0, len(words), step):
-        chunk = " ".join(words[i:i + chunk_size])
-
-        if chunk.strip():
-            chunks.append(chunk)
-
-    return chunks
-
-
-# -----------------------------
-# STORE EMBEDDING (DB)
-# -----------------------------
-def store_embedding(client_id, text, embedding):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        INSERT INTO documents (client_id, content, embedding)
-        VALUES (%s, %s, %s)
-        """,
-        (client_id, text, embedding)
-    )
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-# -----------------------------
-# CLEAR CLIENT DATA (IMPORTANT)
-# -----------------------------
-def clear_client_data(client_id):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        "DELETE FROM documents WHERE client_id = %s",
-        (client_id,)
-    )
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-
-# -----------------------------
-# INGESTION (DB ONLY)
-# -----------------------------
-def ingest(client_id="default"):
-    docs = load_documents()
-
-    # optional: clear old data before re-ingesting
-    clear_client_data(client_id)
-
-    for doc in docs:
-        chunks = chunk_text(doc["text"])
-
-        for chunk in chunks:
-            embedding = embed_text(chunk)
-            store_embedding(client_id, chunk, embedding)
-
-    print(f"Ingestion complete for client: {client_id}")
-
-
-# -----------------------------
-# SEARCH (pgvector)
-# -----------------------------
-def search(query, client_id="default", top_k=3):
-    query_embedding = embed_text(query)
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT content, embedding <=> %s AS distance
-        FROM documents
-        WHERE client_id = %s
-        ORDER BY embedding <=> %s
-        LIMIT %s
-        """,
-        (query_embedding, client_id, query_embedding, top_k)
-    )
-
-    results = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    return [
-        {
-            "text": r[0],
-            "score": float(1 - r[1])  # similarity
-        }
-        for r in results
-    ]
-
-
-# -----------------------------
-# CONTEXT
-# -----------------------------
-def build_context(results):
-    return "\n\n".join([r["text"] for r in results])
-
-
-# -----------------------------
-# PROMPT
-# -----------------------------
-def build_prompt(context, query):
-    return f"""
-You are a helpful customer support assistant.
-
-Rules:
-- Only use the context below
-- If not found, say "I don't know"
-- Be concise and helpful
-
-Context:
-{context}
-
-Question:
-{query}
-
-Answer:
-""".strip()
-
-
-# -----------------------------
-# LLM CALL (Ollama)
-# -----------------------------
-def generate_answer(prompt):
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={
-            "model": "llama3",
-            "prompt": prompt,
-            "stream": False
-        }
-    )
-
-    return response.json()["response"]
-
-
-# -----------------------------
-# MAIN PIPELINE
-# -----------------------------
-def ask_question(query, client_id="default"):
-    results = search(query, client_id)
-
-    context = build_context(results)
-
-    prompt = build_prompt(context, query)
-
-    answer = generate_answer(prompt)
+    response = ask_question(req.query, req.client_id)
 
     return {
-        "answer": answer,
-        "sources": results
+        "answer": response["answer"],
+        "sources": response["sources"]
     }
 
 
 # -----------------------------
-# LOCAL TEST
+# INGEST ENDPOINT
 # -----------------------------
-if __name__ == "__main__":
-    client_id = "test_client"
+@app.post("/ingest")
+def ingest_data(req: IngestRequest):
+    ingest(req.client_id)
 
-    # 1. ingest data
-    ingest(client_id)
+    return {
+        "message": f"Ingestion complete for client: {req.client_id}"
+    }
 
-    # 2. query
-    query = "my order did not get here?"
 
-    response = ask_question(query, client_id)
-
-    print("\nANSWER:\n", response["answer"])
-
-    print("\nSOURCES:")
-    for r in response["sources"]:
-        print("-", round(r["score"], 3))
+# -----------------------------
+# HEALTH CHECK (optional but useful)
+# -----------------------------
+@app.get("/")
+def root():
+    return {"status": "API is running"}

@@ -88,7 +88,7 @@ def clear_client_data(client_id):
 # INGESTION (DB ONLY)
 # -----------------------------
 def ingest(client_id="default"):
-    docs = load_documents()
+    docs = load_documents(client_id)
 
     # optional: clear old data before re-ingesting
     clear_client_data(client_id)
